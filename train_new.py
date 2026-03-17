@@ -69,6 +69,8 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     # 【核心改动】：使用庞加莱投影公式，将点向边缘拉伸，制造“均匀分布”的学术感
     px = x1 / (1 + x0)
     py = x2 / (1 + x0)
+
+
     r_boundary = np.sqrt(v_max - 1) / np.sqrt(v_max + 1)  # 庞加莱圆盘的边界
 
     circle = plt.Circle((0, 0), r_boundary, color='lightgrey', fill=False, linewidth=1.5, linestyle='--')

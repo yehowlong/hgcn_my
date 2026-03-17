@@ -104,7 +104,7 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     )
     values = torch.Tensor(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
-    return torch.sparse.FloatTensor(indices, values, shape)
+    return torch.sparse_coo_tensor(indices, values, shape, dtype=torch.float32)
 
 
 def augment(adj, features, normalize_feats=True):
