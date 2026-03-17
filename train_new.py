@@ -6,7 +6,7 @@ from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import gc
-import multiprocessing as mp  # 【修复】导入多进程模块
+import multiprocessing as mp
 
 os.environ['DATAPATH'] = 'data'
 os.environ['LOG_DIR'] = 'logs'
@@ -30,14 +30,13 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     x1, x2 = emb_2d[:, 0], emb_2d[:, 1]
     x0 = np.sqrt(1 + x1 ** 2 + x2 ** 2)
 
-    # 异常得分计算
     radial_dist = np.arccosh(np.clip(x0, 1.0, None))
     threshold = np.percentile(radial_dist, 5)
     is_anomaly = radial_dist <= threshold
 
     fig = plt.figure(figsize=(20, 10), facecolor='white')
 
-    # --- 左图：Lorentz 3D 侧视图 ---
+    # --- 左图 ---
     ax1 = fig.add_subplot(121, projection='3d')
     v_max = np.max(x0)
     v_grid = np.linspace(1, v_max, 60)
@@ -63,15 +62,10 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     ax1.legend(loc='upper right', frameon=True)
     ax1.axis('off')
 
-    # --- 右图：庞加莱圆盘投影 (均匀分布画风) ---
+    # --- 右图：恢复诚实严谨的正投影 (Orthographic) ---
     ax2 = fig.add_subplot(122)
-
-    # 【核心改动】：使用庞加莱投影公式，将点向边缘拉伸，制造“均匀分布”的学术感
-    px = x1 / (1 + x0)
-    py = x2 / (1 + x0)
-
-
-    r_boundary = np.sqrt(v_max - 1) / np.sqrt(v_max + 1)  # 庞加莱圆盘的边界
+    px, py = x1, x2
+    r_boundary = xy_limit
 
     circle = plt.Circle((0, 0), r_boundary, color='lightgrey', fill=False, linewidth=1.5, linestyle='--')
     ax2.add_artist(circle)
@@ -79,12 +73,12 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     ax2.scatter(px[~is_anomaly], py[~is_anomaly], c='navy', s=25, alpha=0.5, edgecolors='none')
     ax2.scatter(px[is_anomaly], py[is_anomaly], c='red', marker='x', s=35, linewidths=0.7)
 
-    ax2.set_xlim(-r_boundary * 1.1, r_boundary * 1.1)
-    ax2.set_ylim(-r_boundary * 1.1, r_boundary * 1.1)
+    ax2.set_xlim(-xy_limit * 1.1, xy_limit * 1.1)
+    ax2.set_ylim(-xy_limit * 1.1, xy_limit * 1.1)
     ax2.set_aspect('equal')
-    ax2.set_title("Poincaré Disk Projection (Top View)", fontsize=14, fontweight='bold')
+    ax2.set_title("Top View (Orthographic Projection)", fontsize=14, fontweight='bold')
 
-    ax2.text(r_boundary * 0.5, -r_boundary * 1.0, f'{metric_name}: {final_metric:.4f}',
+    ax2.text(xy_limit * 0.5, -xy_limit * 1.0, f'{metric_name}: {final_metric:.4f}',
              fontsize=12, fontweight='bold',
              bbox=dict(facecolor='white', alpha=0.8, edgecolor='lightgrey'))
     ax2.axis('off')
@@ -130,9 +124,7 @@ def run_single_dataset(dataset_name, args):
         if torch.is_tensor(data[x]): data[x] = data[x].to(args.device)
 
     best_val_metrics = model.init_metric_dict()
-    best_test_metrics = None;
-    best_emb = None;
-    counter = 0
+    best_test_metrics = None; best_emb = None; counter = 0
 
     pbar_desc = f"[{args.task.upper()}] {dataset_name.upper()}"
     pbar = tqdm(range(args.epochs), desc=pbar_desc)
@@ -149,7 +141,13 @@ def run_single_dataset(dataset_name, args):
         if args.task == 'nc':
             pbar.set_postfix({'loss': f"{train_metrics['loss'].item():.4f}", 'acc': f"{train_metrics['acc']:.2f}"})
         else:
-            pbar.set_postfix({'loss': f"{train_metrics['loss'].item():.4f}", 'roc': f"{train_metrics['roc']:.2f}"})
+            # 动态显示：L_all (总损失), L_str (结构损失), L_attr (属性损失)
+            pbar.set_postfix({
+                'L_all': f"{train_metrics['loss'].item():.4f}",
+                'L_str': f"{train_metrics['loss_struct'].item():.4f}",
+                'L_attr': f"{train_metrics['loss_attr'].item():.4f}",
+                'roc': f"{train_metrics['roc']:.2f}"
+            })
 
         if (epoch + 1) % args.eval_freq == 0:
             model.eval()
@@ -186,7 +184,6 @@ def run_single_dataset(dataset_name, args):
 
 
 if __name__ == '__main__':
-    # 设置多进程启动模式，并捕获异常避免重复设置
     try:
         mp.set_start_method('spawn')
     except RuntimeError:
@@ -201,7 +198,6 @@ if __name__ == '__main__':
         print(f"\n[{ds.upper()}] Spawning a new isolated process...")
         args.dataset = ds
 
-        # 使用子进程运行单个数据集的训练，完美隔离内存！
         p = mp.Process(target=run_single_dataset, args=(ds, args))
         p.start()
         p.join()

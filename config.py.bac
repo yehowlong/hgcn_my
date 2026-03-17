@@ -57,4 +57,3 @@ config_args = {
 parser = argparse.ArgumentParser()
 for _, config_dict in config_args.items():
     parser = add_flags_from_config(parser, config_dict)
-parser.add_argument('--alpha', type=float, default=1.0, help='Weight for Attribute Reconstruction Loss')

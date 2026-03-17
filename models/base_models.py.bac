@@ -91,52 +91,46 @@ class NCModel(BaseModel):
 
 class LPModel(BaseModel):
     """
-    Base model for link prediction task with Anomaly Detection Attribute Loss.
+    Base model for link prediction task.
     """
 
     def __init__(self, args):
         super(LPModel, self).__init__(args)
-        self.decoder = model2decoder[args.model](self.c, args)
-        # 【新增】：属性解码器，用于将嵌入维度的特征还原回原始特征维度
-        self.attr_decoder = nn.Linear(args.dim, args.feat_dim)
+        self.dc = FermiDiracDecoder(r=args.r, t=args.t)
+        self.nb_false_edges = args.nb_false_edges
+        self.nb_edges = args.nb_edges
+
+    def decode(self, h, idx):
+        if self.manifold_name == 'Euclidean':
+            h = self.manifold.normalize(h)
+        emb_in = h[idx[:, 0], :]
+        emb_out = h[idx[:, 1], :]
+        sqdist = self.manifold.sqdist(emb_in, emb_out, self.c)
+        probs = self.dc.forward(sqdist)
+        return probs
 
     def compute_metrics(self, embeddings, data, split):
         if split == 'train':
-            edges_false = data[f'{split}_edges_false']
-            edges_true = data[f'{split}_edges']
+            edges_false = data[f'{split}_edges_false'][np.random.randint(0, self.nb_false_edges, self.nb_edges)]
         else:
             edges_false = data[f'{split}_edges_false']
-            edges_true = data[f'{split}_edges']
-
-        # 1. 结构损失 (Structural Loss) - 原有逻辑
-        loss_struct = self.decoder.compute_loss(embeddings, edges_true, edges_false)
-
-        # 2. 属性重建损失 (Attribute Loss) - 【新增逻辑】
-        # 将双曲空间中的 embeddings 映射到原点处的切空间（欧式空间）
-        embeddings_tg = self.manifold.logmap0(embeddings, c=self.c)
-        # 通过线性层解码重构特征
-        reconstructed_features = self.attr_decoder(embeddings_tg)
-        # 使用 MSE 计算重构误差
-        loss_attr = F.mse_loss(reconstructed_features, data['features'])
-
-        # 3. 联合优化：总损失 = 结构损失 + alpha * 属性损失
-        alpha = getattr(self.args, 'alpha', 1.0)
-        loss = loss_struct + alpha * loss_attr
-
-        if split == 'train':
-            # 记录拆分后的损失，方便在训练时实时观察
-            metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr}
-        else:
-            metrics = {}
-
-        if split == 'val':
-            roc, ap = eval_utils.get_roc_score(embeddings, edges_true, edges_false, self.c, self.args)
-            metrics['roc'] = roc
-            metrics['ap'] = ap
-        elif split == 'test':
-            roc, ap = eval_utils.get_roc_score(embeddings, edges_true, edges_false, self.c, self.args)
-            metrics['roc'] = roc
-            metrics['ap'] = ap
-
+        pos_scores = self.decode(embeddings, data[f'{split}_edges'])
+        neg_scores = self.decode(embeddings, edges_false)
+        loss = F.binary_cross_entropy(pos_scores, torch.ones_like(pos_scores))
+        loss += F.binary_cross_entropy(neg_scores, torch.zeros_like(neg_scores))
+        if pos_scores.is_cuda:
+            pos_scores = pos_scores.cpu()
+            neg_scores = neg_scores.cpu()
+        labels = [1] * pos_scores.shape[0] + [0] * neg_scores.shape[0]
+        preds = list(pos_scores.data.numpy()) + list(neg_scores.data.numpy())
+        roc = roc_auc_score(labels, preds)
+        ap = average_precision_score(labels, preds)
+        metrics = {'loss': loss, 'roc': roc, 'ap': ap}
         return metrics
+
+    def init_metric_dict(self):
+        return {'roc': -1, 'ap': -1}
+
+    def has_improved(self, m1, m2):
+        return 0.5 * (m1['roc'] + m1['ap']) < 0.5 * (m2['roc'] + m2['ap'])
 
