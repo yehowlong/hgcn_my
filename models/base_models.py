@@ -96,7 +96,8 @@ class LPModel(BaseModel):
 
     def __init__(self, args):
         super(LPModel, self).__init__(args)
-        self.decoder = model2decoder[args.model](self.c, args)
+        # 【关键修复】：这里必须是 args.manifold，用于加载 FermiDirac 距离解码器
+        self.decoder = model2decoder[args.manifold](self.c, args)
         # 属性解码器：将嵌入维度的特征还原回原始特征维度
         self.attr_decoder = nn.Linear(args.dim, args.feat_dim)
 
