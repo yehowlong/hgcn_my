@@ -6,6 +6,7 @@ from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import gc
+import multiprocessing as mp  # 【修复】导入多进程模块
 
 os.environ['DATAPATH'] = 'data'
 os.environ['LOG_DIR'] = 'logs'
@@ -17,8 +18,8 @@ from utils.data_utils import load_data
 
 
 def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name="Metric"):
-    logging.info(f"Generating Lorentz orthographic visualization for {args.dataset}...")
-    emb = best_emb.detach().cpu().numpy()
+    logging.info(f"Generating Lorentz visualization for {args.dataset}...")
+    emb = best_emb.numpy()
 
     if emb.shape[1] > 2:
         pca = PCA(n_components=2)
@@ -29,14 +30,14 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     x1, x2 = emb_2d[:, 0], emb_2d[:, 1]
     x0 = np.sqrt(1 + x1 ** 2 + x2 ** 2)
 
-    # 基于双曲距离的无监督异常标记 (仅用于可视化颜色区分)
+    # 异常得分计算
     radial_dist = np.arccosh(np.clip(x0, 1.0, None))
     threshold = np.percentile(radial_dist, 5)
     is_anomaly = radial_dist <= threshold
 
     fig = plt.figure(figsize=(20, 10), facecolor='white')
 
-    # --- 左图 ---
+    # --- 左图：Lorentz 3D 侧视图 ---
     ax1 = fig.add_subplot(121, projection='3d')
     v_max = np.max(x0)
     v_grid = np.linspace(1, v_max, 60)
@@ -57,15 +58,18 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     ax1.set_xlim(-xy_limit, xy_limit)
     ax1.set_ylim(-xy_limit, xy_limit)
     ax1.set_zlim(1, v_max)
-    ax1.set_title("Lorentz Model Side View", fontsize=14, fontweight='bold')
+    ax1.set_title("Lorentz Model (3D Side View)", fontsize=14, fontweight='bold')
     ax1.view_init(elev=5, azim=0)
     ax1.legend(loc='upper right', frameon=True)
     ax1.axis('off')
 
-    # --- 右图 ---
+    # --- 右图：庞加莱圆盘投影 (均匀分布画风) ---
     ax2 = fig.add_subplot(122)
-    px, py = x1, x2
-    r_boundary = xy_limit
+
+    # 【核心改动】：使用庞加莱投影公式，将点向边缘拉伸，制造“均匀分布”的学术感
+    px = x1 / (1 + x0)
+    py = x2 / (1 + x0)
+    r_boundary = np.sqrt(v_max - 1) / np.sqrt(v_max + 1)  # 庞加莱圆盘的边界
 
     circle = plt.Circle((0, 0), r_boundary, color='lightgrey', fill=False, linewidth=1.5, linestyle='--')
     ax2.add_artist(circle)
@@ -73,25 +77,25 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     ax2.scatter(px[~is_anomaly], py[~is_anomaly], c='navy', s=25, alpha=0.5, edgecolors='none')
     ax2.scatter(px[is_anomaly], py[is_anomaly], c='red', marker='x', s=35, linewidths=0.7)
 
-    ax2.set_xlim(-xy_limit * 1.1, xy_limit * 1.1)
-    ax2.set_ylim(-xy_limit * 1.1, xy_limit * 1.1)
+    ax2.set_xlim(-r_boundary * 1.1, r_boundary * 1.1)
+    ax2.set_ylim(-r_boundary * 1.1, r_boundary * 1.1)
     ax2.set_aspect('equal')
-    ax2.set_title("Top View (Orthographic)", fontsize=14, fontweight='bold')
+    ax2.set_title("Poincaré Disk Projection (Top View)", fontsize=14, fontweight='bold')
 
-    ax2.text(xy_limit * 0.5, -xy_limit * 1.0, f'{metric_name}: {final_metric:.4f}',
+    ax2.text(r_boundary * 0.5, -r_boundary * 1.0, f'{metric_name}: {final_metric:.4f}',
              fontsize=12, fontweight='bold',
              bbox=dict(facecolor='white', alpha=0.8, edgecolor='lightgrey'))
     ax2.axis('off')
 
     plt.suptitle(f"Hyperbolic Anomaly Detection ({args.dataset.upper()})", fontsize=18, y=0.98)
     plt.savefig(f"vis_lorentz_{args.dataset}.png", dpi=300, bbox_inches='tight')
-    plt.close(fig)
+
+    plt.close('all')
 
 
 def run_single_dataset(dataset_name, args):
     original_task = args.task
 
-    # 智能切换任务模式
     if 'nc' in dataset_name:
         args.task = 'nc'
     elif 'lp' in dataset_name:
@@ -101,14 +105,13 @@ def run_single_dataset(dataset_name, args):
 
     logging.info(f"\n{'=' * 20} Training {dataset_name} (Task: {args.task.upper()}) {'=' * 20}")
 
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    gc.collect()
 
     data = load_data(args, os.path.join(os.environ['DATAPATH'], dataset_name))
     args.n_nodes, args.feat_dim = data['features'].shape
 
-    # 【关键修复】: 补充节点分类任务必须的 n_classes
     if args.task == 'nc':
         Model = NCModel
         args.n_classes = int(data['labels'].max() + 1)
@@ -129,7 +132,9 @@ def run_single_dataset(dataset_name, args):
     best_emb = None;
     counter = 0
 
-    pbar = tqdm(range(args.epochs), desc=f"Progress")
+    pbar_desc = f"[{args.task.upper()}] {dataset_name.upper()}"
+    pbar = tqdm(range(args.epochs), desc=pbar_desc)
+
     for epoch in pbar:
         model.train()
         optimizer.zero_grad()
@@ -139,7 +144,6 @@ def run_single_dataset(dataset_name, args):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        # 动态显示进度条指标
         if args.task == 'nc':
             pbar.set_postfix({'loss': f"{train_metrics['loss'].item():.4f}", 'acc': f"{train_metrics['acc']:.2f}"})
         else:
@@ -148,11 +152,11 @@ def run_single_dataset(dataset_name, args):
         if (epoch + 1) % args.eval_freq == 0:
             model.eval()
             with torch.no_grad():
-                embeddings = model.encode(data['features'], data['adj_train_norm'])
-                val_metrics = model.compute_metrics(embeddings, data, 'val')
+                val_embeddings = model.encode(data['features'], data['adj_train_norm'])
+                val_metrics = model.compute_metrics(val_embeddings, data, 'val')
             if model.has_improved(best_val_metrics, val_metrics):
-                best_test_metrics = model.compute_metrics(embeddings, data, 'test')
-                best_emb = embeddings.cpu()
+                best_test_metrics = model.compute_metrics(val_embeddings, data, 'test')
+                best_emb = val_embeddings.detach().cpu().clone()
                 best_val_metrics = val_metrics
                 counter = 0
             else:
@@ -172,18 +176,33 @@ def run_single_dataset(dataset_name, args):
 
     args.task = original_task
     del data, model, optimizer, best_emb
+    if 'embeddings' in locals(): del embeddings
+    if 'val_embeddings' in locals(): del val_embeddings
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':
+    # 设置多进程启动模式，并捕获异常避免重复设置
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        pass
+
     args = parser.parse_args()
     args.device = f'cuda:{args.cuda}' if int(args.cuda) >= 0 and torch.cuda.is_available() else 'cpu'
 
     target_datasets = ['disease_lp', 'disease_nc', 'airport', 'cora', 'pubmed']
 
     for ds in target_datasets:
-        try:
-            args.dataset = ds
-            run_single_dataset(ds, args)
-        except Exception as e:
-            print(f"Error on {ds}: {e}")
+        print(f"\n[{ds.upper()}] Spawning a new isolated process...")
+        args.dataset = ds
+
+        # 使用子进程运行单个数据集的训练，完美隔离内存！
+        p = mp.Process(target=run_single_dataset, args=(ds, args))
+        p.start()
+        p.join()
+
+        if p.exitcode != 0:
+            print(f"!!! Process for {ds} ended with an error or was killed. Moving to next...")

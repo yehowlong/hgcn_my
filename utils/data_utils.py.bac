@@ -9,26 +9,7 @@ import scipy.sparse as sp
 import torch
 
 
-BOND_DATASETS = {
-    'books',
-    'disney',
-    'enron',
-    'reddit',
-    'weibo',
-    'inj_cora',
-    'inj_amazon',
-    'inj_flickr',
-    'gen_100',
-    'gen_500',
-    'gen_1000',
-    'gen_5000',
-    'gen_10000',
-    'gen_time',
-}
-
-
 def load_data(args, datapath):
-    datapath = resolve_data_path(args.dataset, datapath)
     if args.task == 'nc':
         data = load_data_nc(args.dataset, args.use_feats, datapath, args.split_seed)
     else:
@@ -48,27 +29,6 @@ def load_data(args, datapath):
     if args.dataset == 'airport':
         data['features'] = augment(data['adj_train'], data['features'])
     return data
-
-
-def resolve_data_path(dataset, datapath):
-    if os.path.isdir(datapath):
-        return datapath
-
-    candidates = []
-    if dataset in BOND_DATASETS:
-        candidates.extend([
-            os.path.join(os.getcwd(), 'data_bond', dataset),
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data_bond', dataset),
-        ])
-        hgcn_home = os.environ.get('HGCN_HOME')
-        if hgcn_home:
-            candidates.append(os.path.join(hgcn_home, 'data_bond', dataset))
-
-    for candidate in candidates:
-        if os.path.isdir(candidate):
-            return candidate
-
-    raise FileNotFoundError('Dataset path {} does not exist and no fallback was found for dataset {}.'.format(datapath, dataset))
 
 
 # ############### FEATURES PROCESSING ####################################
@@ -139,11 +99,13 @@ def mask_edges(adj, val_prop, test_prop, seed):
     adj_train = adj_train + adj_train.T
     return adj_train, torch.LongTensor(train_edges), torch.LongTensor(train_edges_false), torch.LongTensor(val_edges), \
            torch.LongTensor(val_edges_false), torch.LongTensor(test_edges), torch.LongTensor(
-            test_edges_false)
+            test_edges_false)  
 
 
 def split_data(labels, val_prop, test_prop, seed):
     np.random.seed(seed)
+    nb_nodes = labels.shape[0]
+    all_idx = np.arange(nb_nodes)
     pos_idx = labels.nonzero()[0]
     neg_idx = (1. - labels).nonzero()[0]
     np.random.shuffle(pos_idx)
@@ -171,7 +133,7 @@ def bin_feat(feat, bins):
 def load_data_lp(dataset, use_feats, data_path):
     if dataset in ['cora', 'pubmed']:
         adj, features = load_citation_data(dataset, use_feats, data_path)[:2]
-    elif dataset in ['disease_lp'] or dataset in BOND_DATASETS:
+    elif dataset == 'disease_lp':
         adj, features = load_synthetic_data(dataset, use_feats, data_path)[:2]
     elif dataset == 'airport':
         adj, features = load_data_airport(dataset, data_path, return_label=False)
@@ -196,9 +158,6 @@ def load_data_nc(dataset, use_feats, data_path, split_seed):
         elif dataset == 'airport':
             adj, features, labels = load_data_airport(dataset, data_path, return_label=True)
             val_prop, test_prop = 0.15, 0.15
-        elif dataset in BOND_DATASETS:
-            adj, features, labels = load_synthetic_data(dataset, use_feats, data_path)
-            val_prop, test_prop = 0.10, 0.20
         else:
             raise FileNotFoundError('Dataset {} is not supported.'.format(dataset))
         idx_val, idx_test, idx_train = split_data(labels, val_prop, test_prop, seed=split_seed)
@@ -250,38 +209,36 @@ def parse_index_file(filename):
 
 
 def load_synthetic_data(dataset_str, use_feats, data_path):
-    edges = np.loadtxt(os.path.join(data_path, "{}.edges.csv".format(dataset_str)), delimiter=',', dtype=np.int64)
-    if edges.ndim == 1:
-        edges = edges.reshape(1, 2)
-    num_nodes = int(edges.max()) + 1 if edges.size else infer_num_nodes_from_features_or_labels(dataset_str, data_path)
-    row = edges[:, 0]
-    col = edges[:, 1]
-    values = np.ones(edges.shape[0], dtype=np.float32)
-    adj = sp.csr_matrix((values, (row, col)), shape=(num_nodes, num_nodes))
-    adj = adj + adj.T
-    adj.data[:] = 1.0
-
+    object_to_idx = {}
+    idx_counter = 0
+    edges = []
+    with open(os.path.join(data_path, "{}.edges.csv".format(dataset_str)), 'r') as f:
+        all_edges = f.readlines()
+    for line in all_edges:
+        n1, n2 = line.rstrip().split(',')
+        if n1 in object_to_idx:
+            i = object_to_idx[n1]
+        else:
+            i = idx_counter
+            object_to_idx[n1] = i
+            idx_counter += 1
+        if n2 in object_to_idx:
+            j = object_to_idx[n2]
+        else:
+            j = idx_counter
+            object_to_idx[n2] = j
+            idx_counter += 1
+        edges.append((i, j))
+    adj = np.zeros((len(object_to_idx), len(object_to_idx)))
+    for i, j in edges:
+        adj[i, j] = 1.  # comment this line for directed adjacency matrix
+        adj[j, i] = 1.
     if use_feats:
         features = sp.load_npz(os.path.join(data_path, "{}.feats.npz".format(dataset_str)))
     else:
-        features = sp.eye(adj.shape[0], dtype=np.float32)
-
-    labels_path = os.path.join(data_path, "{}.labels_binary.npy".format(dataset_str))
-    if not os.path.exists(labels_path):
-        labels_path = os.path.join(data_path, "{}.labels.npy".format(dataset_str))
-    labels = np.load(labels_path)
-    return adj, features, labels
-
-
-def infer_num_nodes_from_features_or_labels(dataset_str, data_path):
-    feat_path = os.path.join(data_path, "{}.feats.npz".format(dataset_str))
-    if os.path.exists(feat_path):
-        return sp.load_npz(feat_path).shape[0]
-    labels_path = os.path.join(data_path, "{}.labels_binary.npy".format(dataset_str))
-    if os.path.exists(labels_path):
-        return np.load(labels_path).shape[0]
-    labels_path = os.path.join(data_path, "{}.labels.npy".format(dataset_str))
-    return np.load(labels_path).shape[0]
+        features = sp.eye(adj.shape[0])
+    labels = np.load(os.path.join(data_path, "{}.labels.npy".format(dataset_str)))
+    return sp.csr_matrix(adj), features, labels
 
 
 def load_data_airport(dataset_str, data_path, return_label=False):
@@ -296,3 +253,4 @@ def load_data_airport(dataset_str, data_path, return_label=False):
         return sp.csr_matrix(adj), features, labels
     else:
         return sp.csr_matrix(adj), features
+
