@@ -3,12 +3,10 @@ import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.nn as nn
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import gc
-import multiprocessing as mp
 
 os.environ['DATAPATH'] = 'data'
 os.environ['LOG_DIR'] = 'logs'
@@ -17,6 +15,7 @@ import optimizers
 from config import parser
 from models.base_models import NCModel, LPModel
 from utils.data_utils import load_data
+
 
 def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name="Metric"):
     logging.info(f"Generating Lorentz Orthographic visualization for {args.dataset}...")
@@ -85,41 +84,30 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     ax2.axis('off')
 
     plt.suptitle(f"Hyperbolic Anomaly Detection ({args.dataset.upper()})", fontsize=18, y=0.98)
-    plt.savefig(f"vis_lorentz_{args.dataset}.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"vis_lorentz_{args.dataset}_{args.task}.png", dpi=300, bbox_inches='tight')
     plt.close('all')
 
 
-def run_single_dataset(dataset_name, args):
-    original_task = args.task
+def train(args):
+    logging.info(f"\n{'=' * 20} Training {args.dataset} (Task: {args.task.upper()}) {'=' * 20}")
 
-    if 'nc' in dataset_name:
-        args.task = 'nc'
-    elif 'lp' in dataset_name:
-        args.task = 'lp'
-    else:
-        args.task = original_task
-
-    logging.info(f"\n{'=' * 20} Training {dataset_name} (Task: {args.task.upper()}) {'=' * 20}")
-
+    # 清理内存
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    data = load_data(args, os.path.join(os.environ['DATAPATH'], dataset_name))
+    # 严格按照 args 设定的 task 加载数据
+    data = load_data(args, os.path.join(os.environ['DATAPATH'], args.dataset))
     args.n_nodes, args.feat_dim = data['features'].shape
 
     if args.task == 'nc':
         Model = NCModel
         args.n_classes = int(data['labels'].max() + 1)
+        logging.info(f"Num classes: {args.n_classes}")
     else:
         Model = LPModel
-        # 【关键修复】：只在 LP 任务下才初始化和调用 edge 相关参数
-        if 'train_edges_false' in data:
-            args.nb_false_edges = len(data['train_edges_false'])
-            args.nb_edges = len(data['train_edges'])
-        else:
-            print(f"Error: {dataset_name} lacks link prediction edges!")
-            return
+        args.nb_false_edges = len(data['train_edges_false'])
+        args.nb_edges = len(data['train_edges'])
 
     model = Model(args).to(args.device)
     optimizer = getattr(optimizers, args.optimizer)(params=model.parameters(), lr=args.lr,
@@ -133,7 +121,7 @@ def run_single_dataset(dataset_name, args):
     best_emb = None;
     counter = 0
 
-    pbar_desc = f"[{args.task.upper()}] {dataset_name.upper()}"
+    pbar_desc = f"[{args.task.upper()}] {args.dataset.upper()}"
     pbar = tqdm(range(args.epochs), desc=pbar_desc)
 
     for epoch in pbar:
@@ -141,21 +129,20 @@ def run_single_dataset(dataset_name, args):
         optimizer.zero_grad()
         embeddings = model.encode(data['features'], data['adj_train_norm'])
 
-        # 【修复 NC 崩溃】：NC 和 LP 的 split 数据结构不同
         train_metrics = model.compute_metrics(embeddings, data, 'train')
         train_metrics['loss'].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         if args.task == 'nc':
-            # NC 任务只有总分类 loss 和 acc
             pbar.set_postfix({'loss': f"{train_metrics['loss'].item():.4f}", 'acc': f"{train_metrics['acc']:.2f}"})
         else:
-            # LP 任务才有结构和属性的拆分
+            # 实时显示结构损失和属性损失
+            L_attr_str = f"{train_metrics['loss_attr'].item():.4f}" if 'loss_attr' in train_metrics else "N/A"
             pbar.set_postfix({
                 'L_all': f"{train_metrics['loss'].item():.4f}",
                 'L_str': f"{train_metrics['loss_struct'].item():.4f}",
-                'L_attr': f"{train_metrics['loss_attr'].item():.4f}",
+                'L_attr': L_attr_str,
                 'roc': f"{train_metrics['roc']:.2f}"
             })
 
@@ -184,33 +171,19 @@ def run_single_dataset(dataset_name, args):
 
         visualize_dual_views(model, best_emb, data, args, final_metric, metric_name)
 
-    args.task = original_task
     del data, model, optimizer, best_emb
-    if 'embeddings' in locals(): del embeddings
-    if 'val_embeddings' in locals(): del val_embeddings
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-if __name__ == '__main__':
-    try:
-        mp.set_start_method('spawn')
-    except RuntimeError:
-        pass
 
+if __name__ == '__main__':
     args = parser.parse_args()
     args.device = f'cuda:{args.cuda}' if int(args.cuda) >= 0 and torch.cuda.is_available() else 'cpu'
 
-    # 包含 pubmed 也不会再爆内存了
-    target_datasets = ['disease_lp', 'disease_nc', 'airport', 'cora', 'pubmed']
-
-    for ds in target_datasets:
-        print(f"\n[{ds.upper()}] Spawning a new isolated process...")
-        args.dataset = ds
-
-        p = mp.Process(target=run_single_dataset, args=(ds, args))
-        p.start()
-        p.join()
-
-        if p.exitcode != 0:
-            print(f"!!! Process for {ds} ended with an error or was killed. Moving to next...")
+    # 不再循环，而是专门针对命令行传入的单个数据集和任务执行
+    try:
+        train(args)
+    except Exception as e:
+        logging.error(f"Error occurred: {e}")
+        raise
