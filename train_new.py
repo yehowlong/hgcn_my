@@ -88,6 +88,7 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     plt.savefig(f"vis_lorentz_{args.dataset}.png", dpi=300, bbox_inches='tight')
     plt.close('all')
 
+
 def run_single_dataset(dataset_name, args):
     original_task = args.task
 
@@ -112,8 +113,13 @@ def run_single_dataset(dataset_name, args):
         args.n_classes = int(data['labels'].max() + 1)
     else:
         Model = LPModel
-        args.nb_false_edges = len(data['train_edges_false'])
-        args.nb_edges = len(data['train_edges'])
+        # 【关键修复】：只在 LP 任务下才初始化和调用 edge 相关参数
+        if 'train_edges_false' in data:
+            args.nb_false_edges = len(data['train_edges_false'])
+            args.nb_edges = len(data['train_edges'])
+        else:
+            print(f"Error: {dataset_name} lacks link prediction edges!")
+            return
 
     model = Model(args).to(args.device)
     optimizer = getattr(optimizers, args.optimizer)(params=model.parameters(), lr=args.lr,
@@ -123,7 +129,9 @@ def run_single_dataset(dataset_name, args):
         if torch.is_tensor(data[x]): data[x] = data[x].to(args.device)
 
     best_val_metrics = model.init_metric_dict()
-    best_test_metrics = None; best_emb = None; counter = 0
+    best_test_metrics = None;
+    best_emb = None;
+    counter = 0
 
     pbar_desc = f"[{args.task.upper()}] {dataset_name.upper()}"
     pbar = tqdm(range(args.epochs), desc=pbar_desc)
@@ -132,15 +140,18 @@ def run_single_dataset(dataset_name, args):
         model.train()
         optimizer.zero_grad()
         embeddings = model.encode(data['features'], data['adj_train_norm'])
+
+        # 【修复 NC 崩溃】：NC 和 LP 的 split 数据结构不同
         train_metrics = model.compute_metrics(embeddings, data, 'train')
         train_metrics['loss'].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         if args.task == 'nc':
+            # NC 任务只有总分类 loss 和 acc
             pbar.set_postfix({'loss': f"{train_metrics['loss'].item():.4f}", 'acc': f"{train_metrics['acc']:.2f}"})
         else:
-            # 实时显示结构损失和属性损失
+            # LP 任务才有结构和属性的拆分
             pbar.set_postfix({
                 'L_all': f"{train_metrics['loss'].item():.4f}",
                 'L_str': f"{train_metrics['loss_struct'].item():.4f}",

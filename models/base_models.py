@@ -87,20 +87,25 @@ class NCModel(BaseModel):
         loss_struct = F.binary_cross_entropy(pos_scores, torch.ones_like(pos_scores))
         loss_struct += F.binary_cross_entropy(neg_scores, torch.zeros_like(neg_scores))
 
-        # 2. 属性重建损失 (Attribute Loss) - 【核心修复区】
+        # 2. 属性重建损失 (Attribute Loss) - 【极致稳定版】
         embeddings_tg = self.manifold.logmap0(embeddings, c=self.c)
-        reconstructed_features = self.attr_decoder(embeddings_tg)
+        reconstructed_raw = self.attr_decoder(embeddings_tg)
 
-        # 【新增】：对原始特征和重构特征进行 L2 归一化，消除量纲差异带来的梯度爆炸
-        # 为了防止除以0，加上一个极小值 eps=1e-8
-        orig_features_norm = F.normalize(data['features'], p=2, dim=1, eps=1e-8)
-        recon_features_norm = F.normalize(reconstructed_features, p=2, dim=1, eps=1e-8)
+        # 核心改动：用 Sigmoid 把重构出的数值死死压在 (0, 1) 之间
+        # 假设原始特征大多在这个范围，或者将其视为概率。这能彻底杜绝数值爆炸！
+        reconstructed_probs = torch.sigmoid(reconstructed_raw)
 
-        # 计算归一化后的 MSE
-        loss_attr = F.mse_loss(recon_features_norm, orig_features_norm)
+        # 同样，为了安全，将原始特征也进行简单的 MinMax 缩放（按特征维度）
+        raw_feat = data['features']
+        # 避免全零除法
+        feat_max = torch.max(raw_feat, dim=0, keepdim=True)[0] + 1e-8
+        feat_min = torch.min(raw_feat, dim=0, keepdim=True)[0]
+        norm_orig_feat = (raw_feat - feat_min) / (feat_max - feat_min)
 
-        # 3. 联合优化：总损失 = 结构损失 + 属性损失
-        # 归一化后，loss_attr 通常在 0.0 ~ 2.0 之间，非常完美地与 loss_struct 平衡！
+        # 现在的 MSE 绝对不会超过 1.0
+        loss_attr = F.mse_loss(reconstructed_probs, norm_orig_feat)
+
+        # 3. 联合优化
         loss = loss_struct + 1.0 * loss_attr
 
         if pos_scores.is_cuda:
@@ -113,7 +118,6 @@ class NCModel(BaseModel):
 
         metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr, 'roc': roc, 'ap': ap}
         return metrics
-
     def init_metric_dict(self):
         return {'acc': -1, 'f1': -1}
 
