@@ -97,7 +97,7 @@ class LPModel(BaseModel):
     def __init__(self, args):
         super(LPModel, self).__init__(args)
         self.decoder = model2decoder[args.model](self.c, args)
-        # 【新增】：属性解码器，用于将嵌入维度的特征还原回原始特征维度
+        # 属性解码器：将嵌入维度的特征还原回原始特征维度
         self.attr_decoder = nn.Linear(args.dim, args.feat_dim)
 
     def compute_metrics(self, embeddings, data, split):
@@ -108,10 +108,10 @@ class LPModel(BaseModel):
             edges_false = data[f'{split}_edges_false']
             edges_true = data[f'{split}_edges']
 
-        # 1. 结构损失 (Structural Loss) - 原有逻辑
+        # 1. 结构损失 (Structural Loss)
         loss_struct = self.decoder.compute_loss(embeddings, edges_true, edges_false)
 
-        # 2. 属性重建损失 (Attribute Loss) - 【新增逻辑】
+        # 2. 属性重建损失 (Attribute Loss)
         # 将双曲空间中的 embeddings 映射到原点处的切空间（欧式空间）
         embeddings_tg = self.manifold.logmap0(embeddings, c=self.c)
         # 通过线性层解码重构特征
@@ -119,12 +119,10 @@ class LPModel(BaseModel):
         # 使用 MSE 计算重构误差
         loss_attr = F.mse_loss(reconstructed_features, data['features'])
 
-        # 3. 联合优化：总损失 = 结构损失 + alpha * 属性损失
-        alpha = getattr(self.args, 'alpha', 1.0)
-        loss = loss_struct + alpha * loss_attr
+        # 3. 联合优化：权重硬编码为 1.0
+        loss = loss_struct + 1.0 * loss_attr
 
         if split == 'train':
-            # 记录拆分后的损失，方便在训练时实时观察
             metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr}
         else:
             metrics = {}

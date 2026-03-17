@@ -2,6 +2,8 @@ import os
 import logging
 import numpy as np
 import torch
+import torch.nn.functional as F
+import torch.nn as nn
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -16,9 +18,8 @@ from config import parser
 from models.base_models import NCModel, LPModel
 from utils.data_utils import load_data
 
-
 def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name="Metric"):
-    logging.info(f"Generating Lorentz visualization for {args.dataset}...")
+    logging.info(f"Generating Lorentz Orthographic visualization for {args.dataset}...")
     emb = best_emb.numpy()
 
     if emb.shape[1] > 2:
@@ -36,7 +37,7 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
 
     fig = plt.figure(figsize=(20, 10), facecolor='white')
 
-    # --- 左图 ---
+    # --- 左图：Lorentz 3D ---
     ax1 = fig.add_subplot(121, projection='3d')
     v_max = np.max(x0)
     v_grid = np.linspace(1, v_max, 60)
@@ -62,7 +63,7 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
     ax1.legend(loc='upper right', frameon=True)
     ax1.axis('off')
 
-    # --- 右图：恢复诚实严谨的正投影 (Orthographic) ---
+    # --- 右图：诚实的学术正投影 (Orthographic) ---
     ax2 = fig.add_subplot(122)
     px, py = x1, x2
     r_boundary = xy_limit
@@ -85,9 +86,7 @@ def visualize_dual_views(model, best_emb, data, args, final_metric, metric_name=
 
     plt.suptitle(f"Hyperbolic Anomaly Detection ({args.dataset.upper()})", fontsize=18, y=0.98)
     plt.savefig(f"vis_lorentz_{args.dataset}.png", dpi=300, bbox_inches='tight')
-
     plt.close('all')
-
 
 def run_single_dataset(dataset_name, args):
     original_task = args.task
@@ -141,7 +140,7 @@ def run_single_dataset(dataset_name, args):
         if args.task == 'nc':
             pbar.set_postfix({'loss': f"{train_metrics['loss'].item():.4f}", 'acc': f"{train_metrics['acc']:.2f}"})
         else:
-            # 动态显示：L_all (总损失), L_str (结构损失), L_attr (属性损失)
+            # 实时显示结构损失和属性损失
             pbar.set_postfix({
                 'L_all': f"{train_metrics['loss'].item():.4f}",
                 'L_str': f"{train_metrics['loss_struct'].item():.4f}",
@@ -182,7 +181,6 @@ def run_single_dataset(dataset_name, args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
 if __name__ == '__main__':
     try:
         mp.set_start_method('spawn')
@@ -192,6 +190,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.device = f'cuda:{args.cuda}' if int(args.cuda) >= 0 and torch.cuda.is_available() else 'cpu'
 
+    # 包含 pubmed 也不会再爆内存了
     target_datasets = ['disease_lp', 'disease_nc', 'airport', 'cora', 'pubmed']
 
     for ds in target_datasets:
