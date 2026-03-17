@@ -75,11 +75,43 @@ class NCModel(BaseModel):
         return F.log_softmax(output[idx], dim=1)
 
     def compute_metrics(self, embeddings, data, split):
-        idx = data[f'idx_{split}']
-        output = self.decode(embeddings, data['adj_train_norm'], idx)
-        loss = F.nll_loss(output, data['labels'][idx], self.weights)
-        acc, f1 = acc_f1(output, data['labels'][idx], average=self.f1_average)
-        metrics = {'loss': loss, 'acc': acc, 'f1': f1}
+        if split == 'train':
+            edges_false = data[f'{split}_edges_false'][np.random.randint(0, self.nb_false_edges, self.nb_edges)]
+        else:
+            edges_false = data[f'{split}_edges_false']
+
+        pos_scores = self.decode(embeddings, data[f'{split}_edges'])
+        neg_scores = self.decode(embeddings, edges_false)
+
+        # 1. 结构损失 (Structural Loss)
+        loss_struct = F.binary_cross_entropy(pos_scores, torch.ones_like(pos_scores))
+        loss_struct += F.binary_cross_entropy(neg_scores, torch.zeros_like(neg_scores))
+
+        # 2. 属性重建损失 (Attribute Loss) - 【核心修复区】
+        embeddings_tg = self.manifold.logmap0(embeddings, c=self.c)
+        reconstructed_features = self.attr_decoder(embeddings_tg)
+
+        # 【新增】：对原始特征和重构特征进行 L2 归一化，消除量纲差异带来的梯度爆炸
+        # 为了防止除以0，加上一个极小值 eps=1e-8
+        orig_features_norm = F.normalize(data['features'], p=2, dim=1, eps=1e-8)
+        recon_features_norm = F.normalize(reconstructed_features, p=2, dim=1, eps=1e-8)
+
+        # 计算归一化后的 MSE
+        loss_attr = F.mse_loss(recon_features_norm, orig_features_norm)
+
+        # 3. 联合优化：总损失 = 结构损失 + 属性损失
+        # 归一化后，loss_attr 通常在 0.0 ~ 2.0 之间，非常完美地与 loss_struct 平衡！
+        loss = loss_struct + 1.0 * loss_attr
+
+        if pos_scores.is_cuda:
+            pos_scores = pos_scores.cpu()
+            neg_scores = neg_scores.cpu()
+        labels = [1] * pos_scores.shape[0] + [0] * neg_scores.shape[0]
+        preds = list(pos_scores.data.numpy()) + list(neg_scores.data.numpy())
+        roc = roc_auc_score(labels, preds)
+        ap = average_precision_score(labels, preds)
+
+        metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr, 'roc': roc, 'ap': ap}
         return metrics
 
     def init_metric_dict(self):
