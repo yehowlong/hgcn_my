@@ -96,46 +96,58 @@ class LPModel(BaseModel):
 
     def __init__(self, args):
         super(LPModel, self).__init__(args)
-        # 【关键修复】：这里必须是 args.manifold，用于加载 FermiDirac 距离解码器
-        self.decoder = model2decoder[args.manifold](self.c, args)
-        # 属性解码器：将嵌入维度的特征还原回原始特征维度
-        self.attr_decoder = nn.Linear(args.dim, args.feat_dim)
+        self.dc = FermiDiracDecoder(r=args.r, t=args.t)
+        self.nb_false_edges = args.nb_false_edges
+        self.nb_edges = args.nb_edges
+
+        # 【新增】：属性解码器。需要扣除掉 Hyperboloid 模型在第0维增加的那1维时间轴
+        orig_feat_dim = args.feat_dim - 1 if args.manifold == 'Hyperboloid' else args.feat_dim
+        self.attr_decoder = nn.Linear(args.dim, orig_feat_dim)
+
+    def decode(self, h, idx):
+        if self.manifold_name == 'Euclidean':
+            h = self.manifold.normalize(h)
+        emb_in = h[idx[:, 0], :]
+        emb_out = h[idx[:, 1], :]
+        sqdist = self.manifold.sqdist(emb_in, emb_out, self.c)
+        probs = self.dc.forward(sqdist)
+        return probs
 
     def compute_metrics(self, embeddings, data, split):
         if split == 'train':
-            edges_false = data[f'{split}_edges_false']
-            edges_true = data[f'{split}_edges']
+            edges_false = data[f'{split}_edges_false'][np.random.randint(0, self.nb_false_edges, self.nb_edges)]
         else:
             edges_false = data[f'{split}_edges_false']
-            edges_true = data[f'{split}_edges']
+
+        pos_scores = self.decode(embeddings, data[f'{split}_edges'])
+        neg_scores = self.decode(embeddings, edges_false)
 
         # 1. 结构损失 (Structural Loss)
-        loss_struct = self.decoder.compute_loss(embeddings, edges_true, edges_false)
+        loss_struct = F.binary_cross_entropy(pos_scores, torch.ones_like(pos_scores))
+        loss_struct += F.binary_cross_entropy(neg_scores, torch.zeros_like(neg_scores))
 
         # 2. 属性重建损失 (Attribute Loss)
-        # 将双曲空间中的 embeddings 映射到原点处的切空间（欧式空间）
         embeddings_tg = self.manifold.logmap0(embeddings, c=self.c)
-        # 通过线性层解码重构特征
         reconstructed_features = self.attr_decoder(embeddings_tg)
-        # 使用 MSE 计算重构误差
         loss_attr = F.mse_loss(reconstructed_features, data['features'])
 
-        # 3. 联合优化：权重硬编码为 1.0
+        # 3. 联合优化：总损失 = 结构损失 + 属性损失
         loss = loss_struct + 1.0 * loss_attr
 
-        if split == 'train':
-            metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr}
-        else:
-            metrics = {}
+        if pos_scores.is_cuda:
+            pos_scores = pos_scores.cpu()
+            neg_scores = neg_scores.cpu()
+        labels = [1] * pos_scores.shape[0] + [0] * neg_scores.shape[0]
+        preds = list(pos_scores.data.numpy()) + list(neg_scores.data.numpy())
+        roc = roc_auc_score(labels, preds)
+        ap = average_precision_score(labels, preds)
 
-        if split == 'val':
-            roc, ap = eval_utils.get_roc_score(embeddings, edges_true, edges_false, self.c, self.args)
-            metrics['roc'] = roc
-            metrics['ap'] = ap
-        elif split == 'test':
-            roc, ap = eval_utils.get_roc_score(embeddings, edges_true, edges_false, self.c, self.args)
-            metrics['roc'] = roc
-            metrics['ap'] = ap
-
+        # 输出字典中加入 loss_struct 和 loss_attr，供外层进度条显示
+        metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr, 'roc': roc, 'ap': ap}
         return metrics
 
+    def init_metric_dict(self):
+        return {'roc': -1, 'ap': -1}
+
+    def has_improved(self, m1, m2):
+        return 0.5 * (m1['roc'] + m1['ap']) < 0.5 * (m2['roc'] + m2['ap'])
