@@ -63,10 +63,10 @@ class NCModel(BaseModel):
             self.f1_average = 'micro'
         else:
             self.f1_average = 'binary'
-
-        # 修复 Bug：这里不能直接用 data['labels']，因为 data 没有传进来
-        # 我们默认正负样本权重一致，或者在外部 train.py 里单独传进来
-        self.weights = torch.Tensor([1.] * args.n_classes)
+        if args.pos_weight:
+            self.weights = torch.Tensor([1., 1. / data['labels'][idx_train].mean()])
+        else:
+            self.weights = torch.Tensor([1.] * args.n_classes)
         if not args.cuda == -1:
             self.weights = self.weights.to(args.device)
 
@@ -75,25 +75,49 @@ class NCModel(BaseModel):
         return F.log_softmax(output[idx], dim=1)
 
     def compute_metrics(self, embeddings, data, split):
-        idx = data[f'idx_{split}']
+        if split == 'train':
+            edges_false = data[f'{split}_edges_false'][np.random.randint(0, self.nb_false_edges, self.nb_edges)]
+        else:
+            edges_false = data[f'{split}_edges_false']
 
-        # 将 labels 确保为 LongTensor 类型，以适应 nll_loss
-        labels = data['labels'][idx]
-        if labels.dim() > 1 and labels.shape[1] > 1:
-            # 如果是 one-hot，转成索引
-            labels = torch.argmax(labels, dim=1)
-        labels = labels.long()
+        pos_scores = self.decode(embeddings, data[f'{split}_edges'])
+        neg_scores = self.decode(embeddings, edges_false)
 
-        output = self.decode(embeddings, data['adj_train_norm'], idx)
+        # 1. 结构损失 (Structural Loss)
+        loss_struct = F.binary_cross_entropy(pos_scores, torch.ones_like(pos_scores))
+        loss_struct += F.binary_cross_entropy(neg_scores, torch.zeros_like(neg_scores))
 
-        # 确保 weights 和 labels 在同一个设备上
-        weights = self.weights.to(output.device)
+        # 2. 属性重建损失 (Attribute Loss) - 【极致稳定版】
+        embeddings_tg = self.manifold.logmap0(embeddings, c=self.c)
+        reconstructed_raw = self.attr_decoder(embeddings_tg)
 
-        loss = F.nll_loss(output, labels, weights)
-        acc, f1 = acc_f1(output, labels, average=self.f1_average)
-        metrics = {'loss': loss, 'acc': acc, 'f1': f1}
+        # 核心改动：用 Sigmoid 把重构出的数值死死压在 (0, 1) 之间
+        # 假设原始特征大多在这个范围，或者将其视为概率。这能彻底杜绝数值爆炸！
+        reconstructed_probs = torch.sigmoid(reconstructed_raw)
+
+        # 同样，为了安全，将原始特征也进行简单的 MinMax 缩放（按特征维度）
+        raw_feat = data['features']
+        # 避免全零除法
+        feat_max = torch.max(raw_feat, dim=0, keepdim=True)[0] + 1e-8
+        feat_min = torch.min(raw_feat, dim=0, keepdim=True)[0]
+        norm_orig_feat = (raw_feat - feat_min) / (feat_max - feat_min)
+
+        # 现在的 MSE 绝对不会超过 1.0
+        loss_attr = F.mse_loss(reconstructed_probs, norm_orig_feat)
+
+        # 3. 联合优化
+        loss = loss_struct + 1.0 * loss_attr
+
+        if pos_scores.is_cuda:
+            pos_scores = pos_scores.cpu()
+            neg_scores = neg_scores.cpu()
+        labels = [1] * pos_scores.shape[0] + [0] * neg_scores.shape[0]
+        preds = list(pos_scores.data.numpy()) + list(neg_scores.data.numpy())
+        roc = roc_auc_score(labels, preds)
+        ap = average_precision_score(labels, preds)
+
+        metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr, 'roc': roc, 'ap': ap}
         return metrics
-
     def init_metric_dict(self):
         return {'acc': -1, 'f1': -1}
 
