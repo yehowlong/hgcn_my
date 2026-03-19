@@ -143,8 +143,22 @@ class LPModel(BaseModel):
         reconstructed_features = self.attr_decoder(embeddings_tg)
         loss_attr = F.mse_loss(reconstructed_features, data['features'])
 
-        # 3. 联合优化：总损失 = 结构损失 + 属性损失
-        loss = loss_struct + 1.0 * loss_attr
+        # ==================== 修改开始 ====================
+        # 3. 联合优化：对 loss 进行归一化处理
+        eps = 1e-8
+
+        # 将各自的 loss 除以它们在当前 step 的标量值（使用 detach 防止梯度截断）
+        # 这样能让两者在计算梯度时，起点都在 1.0 的量级
+        loss_struct_norm = loss_struct / (loss_struct.detach() + eps)
+        loss_attr_norm = loss_attr / (loss_attr.detach() + eps)
+
+        # 计算原始量级的平均值，维持总 loss 的数值规模与归一化前大致相同，
+        # 防止因 loss 骤变导致外层的学习率 (learning rate) 失效。
+        scale = (loss_struct.detach() + loss_attr.detach()) / 2.0
+
+        # 最终相加：
+        loss = scale * (loss_struct_norm + loss_attr_norm)
+        # ==================== 修改结束 ====================
 
         if pos_scores.is_cuda:
             pos_scores = pos_scores.cpu()
@@ -155,6 +169,7 @@ class LPModel(BaseModel):
         ap = average_precision_score(labels, preds)
 
         # 输出字典中加入 loss_struct 和 loss_attr，供外层进度条显示
+        # 注意这里保留了它们原始的未归一化的值，便于你观察 loss 真实下降情况
         metrics = {'loss': loss, 'loss_struct': loss_struct, 'loss_attr': loss_attr, 'roc': roc, 'ap': ap}
         return metrics
 
